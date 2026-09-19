@@ -12,7 +12,6 @@ QQ 号输入到 QQ 的搜索框里（同时把提醒话术复制到剪贴板）�
 """
 
 import json
-import math
 import os
 import queue as _queue
 import re
@@ -31,11 +30,8 @@ except ImportError:                      # 非 Windows 兜底
 
 try:
     import customtkinter as ctk
-except ImportError as _e:
+except ImportError:
     ctk = None
-    _CTK_ERROR = _e
-else:
-    _CTK_ERROR = None
 
 try:
     import keyboard
@@ -49,7 +45,7 @@ else:
 
 APP_NAME = "QQ Hotkey Reminder"
 APP_TITLE = "QQ 快捷提醒助手"
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 CONFIG_NAME = "config.json"
 LOG_NAME = "error.log"
@@ -129,6 +125,7 @@ LIST_HINT = (
     "· 勾选「按行识别」：一行 = 一个人，每行整体去配置里找\n"
     "· 独占一行的「名字 QQ号」优先于配置里的映射（名字不在配置里就新增）\n"
     "· 名字后跟中文逗号或英文逗号加 QQ 号，就像「张三，10001」\n"
+    "· 输入的文字里别带手机号：11 位数字会被误当成 QQ 号拿去搜索\n"
     "· 识别后没匹配到的内容会列在下方让你复核（按行识别时带原行号）\n"
     "· 右边名单可以点 × 删除（删错了重新识别即可）"
 )
@@ -247,12 +244,22 @@ def parse_config_lines(text):
         if not line or line.startswith("#") or line.startswith("＃"):
             continue
         if "=" not in line:
-            # 没有等号：当作 qq_map 的一行「名字 qq」
+            # 没有等号：当作 qq_map 的一行「名字 qq」。
+            # 但配置项/中文标签漏写「=」时（如「type_delay 0.03」）要明确报错，
+            # 不能静默变成一个叫 type_delay 的「人」。
+            if (line in SCALAR_KEYS or line in LABEL_TO_KEY
+                    or line.startswith("hotkeys.") or line.startswith("qq_map.")):
+                return None, f"第 {no} 行：应以「=」分隔，如「{line} = 值」"
+            for lbl in LABEL_TO_KEY:
+                if line.startswith(lbl):
+                    return None, f"第 {no} 行：应以「=」分隔，如「{lbl} = 值」"
             parts = re.split(r"[\s,，]+", line)
             parts = [p for p in parts if p]
             if len(parts) < 2:
                 return None, f"第 {no} 行：应写成「名字 QQ号」或「标签 = 值」：{line}"
             qq = parts[-1]
+            if not QQ_RE.match(qq):
+                return None, f"第 {no} 行：QQ 号应是 5~11 位数字：{line}"
             name = " ".join(parts[:-1]).strip()
             if not name:
                 return None, f"第 {no} 行：缺少名字"
@@ -403,7 +410,7 @@ HEADER_RE = re.compile(
 EXPLICIT_QQ_RE = re.compile(r"[ \t]*[,，;；:：/|][ \t]*(\d{5,11})(?!\d)")
 # 紧跟在名字后面的括号备注，如「王五（已请假）」「张三(未交)」
 NOTE_AT_RE = re.compile(r"[ \t]*[（(【\[『「][^)）\]』」]{0,20}[)）\]』」]")
-# 文本里成对出现的「名字, QQ号」，用于补充 qq_map 里没有的新成员
+# 文本里成对出现的「名字, QQ号」，用于补充 qq_map 里没有的人
 NAME_QQ_RE = re.compile(r"([\u4e00-\u9fff·]{2,8})[ \t]*[,，;；:：/|][ \t]*(\d{5,11})(?!\d)")
 CJK_NAME_RE = re.compile(r"[\u4e00-\u9fff]{2,}")
 # 独占一行的「名字 QQ号」map 格式条目：同名时优先于配置里的映射。
@@ -546,6 +553,7 @@ def scan_text(text, qq_map):
     for name in sorted(set(names) | set(map_line_qq), key=len, reverse=True):
         in_cfg = name in qq_map
         start, count, explicit = 0, 0, None
+        positions = []                       # 命中区间，给左侧高亮用（与识别一致）
         while True:
             i = text.find(name, start)
             if i < 0:
@@ -555,6 +563,7 @@ def scan_text(text, qq_map):
                 start = i + 1
                 continue
             cover(i, j)
+            positions.append((i, j))
             count += 1
             # 名字后面紧跟的括号备注（如「王五（已请假）」）属于这个人，一起吃掉，
             # 免得它被当成「可能漏人」的可疑文字吓人一跳
@@ -573,7 +582,7 @@ def scan_text(text, qq_map):
         # 优先级：行内显式 QQ > 独占一行的 map 条目 > 配置映射
         qq = explicit or map_line_qq.get(name) or (str(qq_map[name]) if in_cfg else None)
         hits.append({"name": name, "qq": qq, "count": count,
-                     "extra": not in_cfg})
+                     "extra": not in_cfg, "pos": positions})
 
     # 命中顺序恢复成配置里的名单顺序，文本里新增的人排在其后（按出现位置）
     order = {str(n).strip(): i for i, n in enumerate(qq_map)}
@@ -590,7 +599,8 @@ def scan_text(text, qq_map):
         if STUDENT_ID_RE.match(qq):
             continue
         cover(m.start(1), m.end(2))
-        tail.append((m.start(1), {"name": name, "qq": qq, "count": 1, "extra": True}))
+        tail.append((m.start(1), {"name": name, "qq": qq, "count": 1, "extra": True,
+                                  "pos": [(m.start(1), m.start(1) + len(name))]}))
         found.add(name)
     tail.sort(key=lambda x: x[0])
     hits += [h for _, h in tail]
@@ -772,6 +782,8 @@ HELP_TEXT = """\
 
     · 按快捷键时鼠标焦点必须在 QQ 的搜索框里：程序会先「全选+删除」清空那个
       输入框再打字，焦点在聊天输入框时按会清掉你打的字。
+    · 待提醒文字里不要包含手机号：11 位数字会被当成 QQ 号拿去搜索，
+      程序不会自动区分手机号和 QQ 号。
     · 程序启动时会自动申请管理员权限（模拟按键需要）；取消授权就退出了。
     · 个别安全软件会拦截模拟按键，误报请自行加白。
     · 按 QQ 号搜索能精确找到好友；按姓名搜索时注意别点错人。
@@ -789,10 +801,13 @@ HELP_TEXT = """\
 class App(ctk.CTk):
     CFG_BUTTONS = ("btn_read", "btn_save", "btn_delete_data")
 
-    # 窗口尺寸：优先用这个舒服的尺寸，但小屏/高缩放时自动缩到屏幕内，
-    # 免得开源出去后 1366x768 或 1K 开 150% 的用户右侧被切掉看不见。
-    PREF_W, PREF_H = 1400, 860          # 理想尺寸（实测信息最完整）
-    MIN_W, MIN_H = 1120, 700            # 布局还能正常用的下限（保证名单可见 4 行）
+    # 窗口尺寸：按「中窗口」直觉启动——开屏大小跟屏幕可用区域按比例走，
+    # 别人的屏幕比你的大/小，窗口就等比大一点/小一点；再封顶/托底，
+    # 保证任何屏幕都放得下且不会「开屏即全屏」。单位表见 _screen_fit 注释。
+    SIZE_FRAC_W = 2 / 3     # 可用宽度的 2/3：你的 1707 逻辑屏上 ≈ 1120
+    SIZE_FRAC_H = 5 / 7     # 可用高度的 5/7：你的 1067 逻辑屏上 ≈ 700
+    CAP_W, CAP_H = 1400, 860        # 大屏封顶（避免开屏即全屏）
+    FLOOR_W, FLOOR_H = 900, 600     # 极小屏托底（再小的屏以屏幕实际可用为准）
 
     def __init__(self):
         super().__init__()
@@ -814,6 +829,8 @@ class App(ctk.CTk):
         self.font_bold = ctk.CTkFont(family="Microsoft YaHei UI", size=15, weight="bold")
         self.font_title = ctk.CTkFont(family="Microsoft YaHei UI", size=19, weight="bold")
         self.font_mono = ctk.CTkFont(family="Consolas", size=14)
+        self.font_row = ctk.CTkFont(family="Microsoft YaHei UI", size=16)    # 队列行主文字
+        self.font_badge = ctk.CTkFont(family="Microsoft YaHei UI", size=14)  # 队列行次要文字/徽章
         self._icons = {}
 
         self.listening = False
@@ -893,25 +910,33 @@ class App(ctk.CTk):
     # ---------- 顶部标题栏 ----------
 
     def _screen_fit(self):
-        """按当前屏幕可用区域算出窗口尺寸和最小尺寸（都是逻辑像素）。
+        """启动尺寸 = 屏幕可用区域 × 固定比例（SIZE_FRAC_*），再封顶/托底。
 
-        CTk 会把逻辑尺寸按 DPI 缩放成物理像素，所以这里统一用逻辑值比较，
-        留出任务栏余量，保证窗口一定放得下——小屏用户也能正常用。
+        屏幕大一号窗口就大一号、小一号就等比缩小；大屏封顶 1400x860
+        （避免开屏即全屏），极小屏托底 900x600（再小以屏幕实际可用为准）。
+
+        本机（Win11 + 150% 缩放 + 2560x1600 屏）实测过的单位表，别再猜：
+          winfo_screenwidth/height -> 1707x1067   逻辑（= 物理 2560x1600 / 1.5）
+          geometry()/minsize()     -> 吃逻辑值，CTk 内部乘缩放
+          winfo_width/height       -> 物理像素（映射后 1400 逻辑实测 2100 物理）
+        所以全程用逻辑像素运算；千万不要拿 winfo_width（物理）来比，
+        否则会把窗口越"缩"越大。
         """
         try:
             sw = self.winfo_screenwidth()
             sh = self.winfo_screenheight()
         except Exception:
-            return self.PREF_W, self.PREF_H, self.MIN_W, self.MIN_H
+            return self.FLOOR_W, self.FLOOR_H, self.FLOOR_W, self.FLOOR_H
         # 任务栏/标题栏留白：宽度留 24，高度留 90（标题栏 + 任务栏 + 边距）
-        avail_w = max(640, sw - 24)
-        avail_h = max(480, sh - 90)
-        w = min(self.PREF_W, avail_w)
-        h = min(self.PREF_H, avail_h)
-        # 最小尺寸不能超过可用区域，否则窗口会被切掉
-        mw = min(self.MIN_W, w)
-        mh = min(self.MIN_H, h)
-        return int(w), int(h), int(mw), int(mh)
+        avail_w = max(640.0, sw - 24)
+        avail_h = max(480.0, sh - 90)
+        w = int(min(self.CAP_W, max(self.FLOOR_W, avail_w * self.SIZE_FRAC_W)))
+        h = int(min(self.CAP_H, max(self.FLOOR_H, avail_h * self.SIZE_FRAC_H)))
+        # 极小屏上托底值也可能超过可用区域：以屏幕为准，保证一定放得下
+        w = min(w, int(avail_w))
+        h = min(h, int(avail_h))
+        # 启动尺寸 = 最小尺寸：窗口打开就是中窗口，要大自己拖/最大化
+        return w, h, w, h
 
     def _build_header(self):
         head = ctk.CTkFrame(self, fg_color="transparent")
@@ -984,54 +1009,6 @@ class App(ctk.CTk):
         self.line_mode_hint = ctk.CTkLabel(
             head_r, text="", font=self.font, text_color=("gray50", "gray60"))
         self.line_mode_hint.pack(side="left", padx=6)
-        self.rows_hint_lbl = ctk.CTkLabel(
-            head_r, text="橙色 = 名单里没这个人，将按姓名搜索",
-            font=self.font, text_color=("gray50", "gray60"))
-        self.rows_hint_lbl.pack(side="right", padx=(8, 0))
-
-        _hdr_job = {"id": None}
-
-        def _check_hint_fits():
-            """布局完成后实测：提示若被压缩过就收起（时序问题靠这个兜底）。"""
-            _hdr_job["id"] = None
-            try:
-                hint = self.rows_hint_lbl
-                if hint.winfo_ismapped() and hint.winfo_width() < hint.winfo_reqwidth() - 2:
-                    hint.pack_forget()
-            except Exception:
-                pass
-
-        def _fit_header(e=None):
-            """窗口变窄时优先保住左边的标题/计数，右侧长提示放不下就收起。
-
-            否则窄窗口下提示会被生硬截断（显示成半截话）。
-            先按实际占位预估决定显隐，再用 after_idle 在布局完成后复核一次
-            （<Configure> 里 winfo_width 还是上一帧的值，不能当场判断）。
-            """
-            try:
-                avail = head_r.winfo_width()
-                if avail <= 1:
-                    return
-                used = 0
-                for w in (self._title_lbl, self.count_lbl, self.line_mode_hint):
-                    if w.winfo_ismapped():
-                        used += w.winfo_width() + 10
-                hint = self.rows_hint_lbl
-                if used + hint.winfo_reqwidth() + 16 > avail:
-                    if hint.winfo_ismapped():
-                        hint.pack_forget()
-                    return
-                if not hint.winfo_ismapped():
-                    hint.pack(side="right", padx=(8, 0))
-                if _hdr_job["id"] is not None:
-                    try:
-                        head_r.after_cancel(_hdr_job["id"])
-                    except Exception:
-                        pass
-                _hdr_job["id"] = head_r.after_idle(_check_hint_fits)
-            except Exception:
-                pass
-        head_r.bind("<Configure>", _fit_header)
 
         # 左列：名单输入
         left = ctk.CTkFrame(f, fg_color="transparent")
@@ -1135,15 +1112,13 @@ class App(ctk.CTk):
         # 复核框高度上限：约 96 物理像素。
         # 注意 CTkTextbox 的 height 是逻辑值、会被 DPI 放大，所以要按缩放系数反算，
         # 否则在高 DPI 下会占掉两三倍高度、把上面的名单挤没。
-        # 队列能看几行由窗口最小高度（MIN_H）保证，这里不再做复杂的自适应。
+        # 队列能看几行由启动尺寸的托底值（FLOOR_H）保证，这里不再做复杂的自适应。
         def _cap_leftover(e=None):
             try:
                 sc = self.leftover_text._apply_widget_scaling(1) or 1
                 want = max(22, int(96 / sc))
                 if abs(self.leftover_text.cget("height") - want) > 4:
                     self.leftover_text.configure(height=want)
-            except Exception:
-                pass
             except Exception:
                 pass
         right.bind("<Configure>", _cap_leftover, add="+")
@@ -1200,7 +1175,7 @@ class App(ctk.CTk):
     # 拖动窗口改尺寸要几百毫秒，肉眼可见迟滞。改成在一个 Canvas 上画所有行，
     # 只有 1 个控件，拖动窗口时快 4~5 倍，而且圆角卡片/状态徽章外观不变。
 
-    ROW_H = 46          # 行高（含间距）
+    ROW_H = 54          # 行高（字号调大后同步加高）
     ROW_GAP = 8         # 行间距
     PAD_X = 8           # 左右留白
 
@@ -1325,13 +1300,12 @@ class App(ctk.CTk):
 
     def _draw_row(self, cv, i, p, y, cw):
         bg = self._row_card_bg()
-        rr = self.ROW_H // 2 - 2
         self._round_rect(cv, self.PAD_X, y, cw - self.PAD_X - 1, y + self.ROW_H, 9, bg)
         cy = y + self.ROW_H // 2
         # 固定右端：状态徽章 + 删除按钮
         del_x2 = cw - self.PAD_X - 12
         del_x1 = del_x2 - 22
-        badge_w = 76
+        badge_w = 80
         badge_x2 = del_x1 - 10
         badge_x1 = badge_x2 - badge_w
         self._del_hit[p["uid"]] = (del_x1 - 6, y + 6, del_x2 + 6, y + self.ROW_H - 6)
@@ -1344,39 +1318,57 @@ class App(ctk.CTk):
         c_qq = int(rest * w_qq)
         # 序号
         cv.create_text(self.PAD_X + 20, cy, text=str(i + 1), anchor="w",
-                       fill=self._row_sub_color(), font=self.font_small)
+                       fill=self._row_sub_color(), font=self.font_badge)
         # 名字（发送失败标红）
-        cv.create_text(name_x, cy, text=self._ellipsis(p["name"], c_name),
-                       anchor="w", font=self.font,
+        cv.create_text(name_x, cy, text=self._ellipsis(p["name"], c_name, self.font_row),
+                       anchor="w", font=self.font_row,
                        fill="#ef4444" if p["status"] == ST_FAILED else self._row_text_color())
         # QQ 号
         qq = p["qq"] or "按姓名搜索"
-        cv.create_text(name_x + c_name, cy, text=self._ellipsis(qq, c_qq), anchor="w",
-                       font=self.font, fill="#f59e0b" if not p["qq"] else self._row_sub_color())
+        cv.create_text(name_x + c_name, cy, text=self._ellipsis(qq, c_qq, self.font_row),
+                       anchor="w", font=self.font_row,
+                       fill="#f59e0b" if not p["qq"] else self._row_sub_color())
         # 附加信息
         cnt = p.get("count") or 1
         meta = f"文本中 {cnt} 处" + ("・新增" if p.get("extra") else "")
-        cv.create_text(name_x + c_name + c_qq, cy, text=self._ellipsis(meta, rest - c_name - c_qq),
-                       anchor="w", font=self.font_small,
+        cv.create_text(name_x + c_name + c_qq, cy,
+                       text=self._ellipsis(meta, rest - c_name - c_qq, self.font_badge),
+                       anchor="w", font=self.font_badge,
                        fill="#38bdf8" if p.get("extra") else self._row_sub_color())
         # 状态徽章
-        self._round_rect(cv, badge_x1, y + 11, badge_x2, y + self.ROW_H - 11, 7,
+        self._round_rect(cv, badge_x1, y + 13, badge_x2, y + self.ROW_H - 13, 7,
                          BADGE_COLORS[p["status"]])
         cv.create_text((badge_x1 + badge_x2) // 2, cy, text=p["status"],
-                       fill="#ffffff", font=self.font_small)
+                       fill="#ffffff", font=self.font_badge)
         # 删除按钮
         cv.create_text((del_x1 + del_x2) // 2, cy, text="✕",
-                       fill="#f87171" if self._dark() else "#dc2626", font=self.font)
+                       fill="#f87171" if self._dark() else "#dc2626", font=self.font_row)
 
-    def _ellipsis(self, text, max_px):
-        """按像素宽度粗略截断，避免文字互相压住。"""
+    def _ellipsis(self, text, max_px, font=None):
+        """用真实字体测量、按像素宽度截断，避免文字互相压住（调字号后仍准确）。"""
         if not text:
             return ""
-        # Consolas/雅黑大约每字符宽度：中文≈字号*1.0，其余≈字号*0.55
-        limit = max(2, int(max_px / 13.0))
-        if len(text) <= limit:
+        font = font or self.font
+        try:
+            px = int(font.measure(text))          # CTkFont 继承自 tkinter.font.Font
+        except Exception:
+            try:
+                fs = max(8, int(font.cget("size")))
+            except Exception:
+                fs = 15
+            px = int(sum(fs if ord(ch) > 0x2E7F else fs * 0.55 for ch in text))
+        if px <= max_px:
             return text
-        return text[:max(1, limit - 1)] + "…"
+        n = len(text)
+        while n > 1:
+            try:
+                w = int(font.measure(text[:n] + "…"))
+            except Exception:
+                w = int(n * max_px / max(1, len(text)))
+            if w <= max_px:
+                break
+            n -= 1
+        return text[:n] + "…"
 
     # 兼容旧调用名（原来每行是独立控件，现在是整块重绘）
     def _rebuild_rows(self):
@@ -1650,18 +1642,12 @@ class App(ctk.CTk):
         except Exception:
             return
         for h in hits:
-            name = h["name"]
-            start = 0
-            while True:
-                i = text.find(name, start)
-                if i < 0:
-                    break
-                # 行/列换算成 Text 索引（名字里不会有换行，所以列不会越行）
+            # 高亮区间直接用 scan 记录的命中位置：与识别逻辑完全一致，
+            # 不会把互为子串的短名字（张三）亮进长名字（张三三）里
+            for i, j in h.get("pos", []):
                 line = text.count("\n", 0, i) + 1
                 col = i - (text.rfind("\n", 0, i) + 1)
-                end = i + len(name)
-                self.list_text.tag_add("hit", f"{line}.{col}", f"{line}.{col + len(name)}")
-                start = end
+                self.list_text.tag_add("hit", f"{line}.{col}", f"{line}.{col + (j - i)}")
 
     def _show_leftover(self, leftover, n_hit):
         """展示未被标记的剩余文本，让用户确认有没有漏人。"""
@@ -1966,6 +1952,12 @@ class App(ctk.CTk):
             if data is None or _norm_dict(data) != _norm_dict(parsed):
                 raise RuntimeError("保存后校验失败：磁盘文件与编辑框内容不一致")
             self.cfg = merged_config(data)
+            # 编辑框里删掉/改了 line_mode 那行时，勾选框要跟着配置走
+            try:
+                self.line_mode_var.set(bool(self.cfg.get("line_mode", False)))
+                self._update_line_mode_hint()
+            except Exception:
+                pass
             self.cfg_log_msg(f"已保存：{target}")
             self._set_cfg_status("已保存", True)
             self._update_progress()
@@ -2047,7 +2039,7 @@ def run_selftest():
             lines += msgs2
 
             # 整段文本检索：名字出现在杂乱的文字里也能找到，且不动原文本
-            qq_map = {"张三": "10001", "李四": "10002", "赵六": "10004"}
+            qq_map = {"张三": "10001", "李四": "10002", "赵六": "10004", "王五": "10003"}
             text = ("未完成名单（共 12 人）\n"
                     "飞机和嘎就看四李四微博张张三三就开始三张三张北京张三控股\n"
                     "1. 张三\n3、赵六 20231101\n新成员，999888777\n")
@@ -2059,8 +2051,9 @@ def run_selftest():
             lines.append(f"scan -> {got}")
             # 学号不能被当成 QQ 号（8 位学号恰好符合 QQ 号长度）
             ok &= all(q != "20231101" for _, q, _ in got)
-            # 没出现的名单成员要报告出来
-            ok &= ("王五" not in missed)
+            # 名单里有、文本里没出现的人必须报告在 missed 里（不能是空断言）
+            ok &= (missed == ["王五"])
+            lines.append(f"missed -> {missed}")
             # 剩余文本：已标记位置用空格顶替，所以不会把相邻残字拼成假名字，
             # 已识别的人名不应再完整出现在剩余文本里；标题行也应被丢掉
             ok &= not any(n in leftover for n, _, _ in got)
@@ -2252,21 +2245,23 @@ def main():
         if not is_admin() and ELEVATED_FLAG not in sys.argv:
             if relaunch_as_admin():
                 return
-            # 用户拒绝了 UAC：明确告知后退出，避免后面按键静默失效
+            # 用户拒绝了 UAC：给一个降级运行的选项，而不是直接退出
             try:
                 import tkinter as _tk
                 from tkinter import messagebox as _mb
                 r = _tk.Tk()
                 r.withdraw()
-                _mb.showwarning(
+                cont = _mb.askyesno(
                     APP_TITLE,
-                    "本程序需要用管理员权限运行才能模拟按键。\n"
-                    "你取消了授权，程序将退出。\n\n"
-                    "如需继续，请重新打开并在弹窗里点「是」。")
+                    "本程序用管理员权限运行才能稳定模拟按键，你刚刚取消了授权。\n\n"
+                    "仍要以普通权限运行吗？\n"
+                    "「是」：继续运行，但全局快捷键/模拟按键可能失效\n"
+                    "「否」：退出程序")
                 r.destroy()
             except Exception:
-                pass
-            return
+                cont = False
+            if not cont:
+                return
     _install_excepthook()
     missing = []
     if ctk is None:
