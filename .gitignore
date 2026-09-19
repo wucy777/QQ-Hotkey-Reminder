@@ -1,0 +1,9 @@
+__pycache__/
+build/
+dist/
+*.spec
+*.exe
+config.json
+error.log
+selftest_result.txt
+*.bad.*
