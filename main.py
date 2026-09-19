@@ -45,7 +45,7 @@ else:
 
 APP_NAME = "QQ Hotkey Reminder"
 APP_TITLE = "QQ 快捷提醒助手"
-__version__ = "1.1.0"
+__version__ = "1.1.1-beta"
 
 CONFIG_NAME = "config.json"
 LOG_NAME = "error.log"
@@ -838,7 +838,7 @@ class App(ctk.CTk):
         self.queue = []            # [{"uid","name","qq","status","count","extra"}]
         self.idx = 0               # 处理指针：下一位待输入的人在 queue 里的位置
         self._uid_seq = 0
-        self._del_hit = {}         # uid -> 删除按钮的命中区域（Canvas 自绘用）
+        self._row_items = {}       # uid -> 行的画布项 id（常驻；悬停/状态/删除只改对应项，不整块重画）
         self.current_config_path = None
         self.cfg = json.loads(json.dumps(DEFAULT_CONFIG))
         self.ui_queue = _queue.Queue()
@@ -958,9 +958,14 @@ class App(ctk.CTk):
         mode.set("深色")
         mode.pack(side="right")
 
-    @staticmethod
-    def _switch_mode(v):
+    def _switch_mode(self, v):
         ctk.set_appearance_mode("dark" if v == "深色" else "light")
+        # 队列行是常驻画布项，换深浅色要同步画布底色并重画一遍
+        try:
+            self.rows_canvas.configure(bg=self._row_bg())
+            self._redraw_rows()
+        except Exception:
+            pass
 
     # ---------- 页签 ----------
 
@@ -1180,7 +1185,8 @@ class App(ctk.CTk):
     PAD_X = 8           # 左右留白
 
     def _build_rows_area(self, parent):
-        """队列区：Canvas + 滚动条，替代 CTkScrollableFrame。"""
+        """队列区：Canvas + 滚动条。行画布项常驻，悬停/点击按项绑定：
+        滚动位置无关、命中由 Canvas 原生处理，常规操作不需要整块重画。"""
         holder = ctk.CTkFrame(parent, fg_color=("gray92", "#1a1e26"), corner_radius=10)
         self.rows_canvas = tk.Canvas(holder, bg=self._row_bg(), bd=0,
                                      highlightthickness=0, takefocus=0)
@@ -1190,10 +1196,6 @@ class App(ctk.CTk):
         self.rows_canvas.pack(side="left", fill="both", expand=True, padx=(4, 0), pady=4)
         self.rows_canvas.bind("<Configure>", self._on_rows_resize)
         self.rows_canvas.bind("<MouseWheel>", self._rows_wheel)
-        # 点击命中：删除按钮 / 该行
-        self.rows_canvas.bind("<Button-1>", self._rows_click)
-        self.rows_canvas.bind("<Motion>", self._rows_motion)
-        self.rows_canvas.bind("<Leave>", lambda e: self.rows_canvas.configure(cursor=""))
         return holder
 
     def _row_bg(self):
@@ -1207,6 +1209,9 @@ class App(ctk.CTk):
 
     def _row_sub_color(self):
         return ("#9ca3af" if ctk.get_appearance_mode() == "Dark" else "#4b5563")
+
+    def _row_card_hover_bg(self):
+        return "#313846" if self._dark() else "#dfe3e9"
 
     def _dark(self):
         return ctk.get_appearance_mode() == "Dark"
@@ -1227,46 +1232,42 @@ class App(ctk.CTk):
             return False
 
     def _on_rows_resize(self, event):
-        """窗口尺寸变化时重排行布局。
+        """窗口尺寸变化时重排行布局（尺寸没变就不画）。
 
         直接重画：单 Canvas 重画只要几毫秒（51 行约 7ms），
         这样拖动窗口时名单是实时跟随的。之前的 after 防抖会让名单
         在拖动过程中不动、松手才跳过去，主观上就是"卡"。
         """
+        key = (event.width, event.height)
+        if key == getattr(self, "_rows_last_size", None):
+            return
+        self._rows_last_size = key
         self._redraw_rows()
 
-    def _round_rect(self, cv, x1, y1, x2, y2, r, fill):
-        """Canvas 上画圆角矩形（用平滑多边形近似）。"""
+    def _round_rect(self, cv, x1, y1, x2, y2, r, fill, tags=()):
+        """Canvas 上画圆角矩形（用平滑多边形近似），返回画布项 id。"""
         pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
                x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
-        cv.create_polygon(pts, smooth=True, splinesteps=3, fill=fill, outline="")
+        return cv.create_polygon(pts, smooth=True, splinesteps=3, fill=fill,
+                                 outline="", tags=tags)
 
-    def _rows_click(self, event):
-        """点删除按钮或行：命中测试靠坐标算（自绘没有独立控件）。"""
-        uid = self._hit_delete(event.x, event.y)
-        if uid is not None:
-            self.op_del_row(uid)
-
-    def _rows_motion(self, event):
-        hit = self._hit_delete(event.x, event.y) is not None
-        want = "hand2" if hit else ""
-        if self.rows_canvas.cget("cursor") != want:
-            self.rows_canvas.configure(cursor=want)
-
-    def _hit_delete(self, x, y):
-        """返回点击位置对应的 uid（只认删除按钮区域）。"""
-        for uid, (x1, y1, x2, y2) in self._del_hit.items():
-            if x1 <= x <= x2 and y1 <= y <= y2:
-                return uid
-        return None
+    def _del_hover(self, uid, on):
+        """✕ 的悬停反馈：只改这一行的两个画布项属性，O(1)，不整块重画。"""
+        it = self._row_items.get(uid)
+        if it is None:
+            return
+        self.rows_canvas.itemconfig(it["hover"],
+                                    fill=self._row_card_hover_bg() if on else "")
+        self.rows_canvas.configure(cursor="hand2" if on else "")
 
     def _redraw_rows(self):
-        """重画整个队列（单控件绘制，比几百个 widget 重排快得多）。"""
+        """整块重画：只在识别名单/重置/换深浅色/窗口尺寸变化时发生，
+        悬停、改状态、删人这些常规操作都不经过这里。"""
         cv = self.rows_canvas
         cw = cv.winfo_width() or 1
         ch = cv.winfo_height() or 1
         cv.delete("all")
-        self._del_hit = {}
+        self._row_items = {}
         order = self._display_order()
         if not order:
             cv.create_text(cw // 2, 40, text="粘贴名单后点击「识别名单」，名单会显示在这里",
@@ -1299,8 +1300,15 @@ class App(ctk.CTk):
                 self.rows_sb.pack_forget()
 
     def _draw_row(self, cv, i, p, y, cw):
+        """画一行。画布项常驻并按 uid 打 tag，之后悬停/改状态/删除
+        都只操作这一行的项；删除按钮的命中由 Canvas 按项处理，
+        与滚动位置无关，不会再出现删错行。"""
+        uid = p["uid"]
+        tag = f"row_{uid}"
+        dtag = f"del_{uid}"
         bg = self._row_card_bg()
-        self._round_rect(cv, self.PAD_X, y, cw - self.PAD_X - 1, y + self.ROW_H, 9, bg)
+        self._round_rect(cv, self.PAD_X, y, cw - self.PAD_X - 1, y + self.ROW_H, 9, bg,
+                         tags=(tag,))
         cy = y + self.ROW_H // 2
         # 固定右端：状态徽章 + 删除按钮
         del_x2 = cw - self.PAD_X - 12
@@ -1308,7 +1316,6 @@ class App(ctk.CTk):
         badge_w = 80
         badge_x2 = del_x1 - 10
         badge_x1 = badge_x2 - badge_w
-        self._del_hit[p["uid"]] = (del_x1 - 6, y + 6, del_x2 + 6, y + self.ROW_H - 6)
         # 自适应列宽：名字/QQ/附加按剩余空间等比分配，窄窗口也不会重叠
         avail = badge_x1 - 8
         w_no, w_name, w_qq, w_meta = 34, 0.34, 0.33, 0.33
@@ -1317,32 +1324,44 @@ class App(ctk.CTk):
         c_name = int(rest * w_name)
         c_qq = int(rest * w_qq)
         # 序号
-        cv.create_text(self.PAD_X + 20, cy, text=str(i + 1), anchor="w",
-                       fill=self._row_sub_color(), font=self.font_badge)
+        idx_id = cv.create_text(self.PAD_X + 20, cy, text=str(i + 1), anchor="w",
+                                fill=self._row_sub_color(), font=self.font_badge,
+                                tags=(tag,))
         # 名字（发送失败标红）
-        cv.create_text(name_x, cy, text=self._ellipsis(p["name"], c_name, self.font_row),
-                       anchor="w", font=self.font_row,
-                       fill="#ef4444" if p["status"] == ST_FAILED else self._row_text_color())
+        name_id = cv.create_text(name_x, cy,
+                                 text=self._ellipsis(p["name"], c_name, self.font_row),
+                                 anchor="w", font=self.font_row, tags=(tag,),
+                                 fill="#ef4444" if p["status"] == ST_FAILED
+                                 else self._row_text_color())
         # QQ 号
         qq = p["qq"] or "按姓名搜索"
         cv.create_text(name_x + c_name, cy, text=self._ellipsis(qq, c_qq, self.font_row),
-                       anchor="w", font=self.font_row,
+                       anchor="w", font=self.font_row, tags=(tag,),
                        fill="#f59e0b" if not p["qq"] else self._row_sub_color())
         # 附加信息
         cnt = p.get("count") or 1
         meta = f"文本中 {cnt} 处" + ("・新增" if p.get("extra") else "")
         cv.create_text(name_x + c_name + c_qq, cy,
                        text=self._ellipsis(meta, rest - c_name - c_qq, self.font_badge),
-                       anchor="w", font=self.font_badge,
+                       anchor="w", font=self.font_badge, tags=(tag,),
                        fill="#38bdf8" if p.get("extra") else self._row_sub_color())
         # 状态徽章
-        self._round_rect(cv, badge_x1, y + 13, badge_x2, y + self.ROW_H - 13, 7,
-                         BADGE_COLORS[p["status"]])
-        cv.create_text((badge_x1 + badge_x2) // 2, cy, text=p["status"],
-                       fill="#ffffff", font=self.font_badge)
-        # 删除按钮
-        cv.create_text((del_x1 + del_x2) // 2, cy, text="✕",
-                       fill="#f87171" if self._dark() else "#dc2626", font=self.font_row)
+        badge_bg = self._round_rect(cv, badge_x1, y + 13, badge_x2, y + self.ROW_H - 13,
+                                    7, BADGE_COLORS[p["status"]], tags=(tag,))
+        badge_tx = cv.create_text((badge_x1 + badge_x2) // 2, cy, text=p["status"],
+                                  fill="#ffffff", font=self.font_badge, tags=(tag,))
+        # 删除按钮：透明热区 + ✕。悬停时热区显示底色（见 _del_hover），
+        # 点击删除这一行；命中由 Canvas 按画布项处理，与滚动位置无关。
+        hover_id = cv.create_rectangle(del_x1 - 5, y + 7, del_x2 + 5, y + self.ROW_H - 7,
+                                       fill="", outline="", width=0, tags=(dtag, tag))
+        cv.create_text((del_x1 + del_x2) // 2, cy, text="✕", font=self.font_row,
+                       fill="#f87171" if self._dark() else "#dc2626", tags=(dtag, tag))
+        cv.tag_bind(dtag, "<Enter>", lambda e, u=uid: self._del_hover(u, True))
+        cv.tag_bind(dtag, "<Leave>", lambda e, u=uid: self._del_hover(u, False))
+        cv.tag_bind(dtag, "<Button-1>", lambda e, u=uid: self.op_del_row(u))
+        self._row_items[uid] = {"index": idx_id, "name": name_id,
+                                "badge_bg": badge_bg, "badge_txt": badge_tx,
+                                "hover": hover_id, "y": y}
 
     def _ellipsis(self, text, max_px, font=None):
         """用真实字体测量、按像素宽度截断，避免文字互相压住（调字号后仍准确）。"""
@@ -1375,13 +1394,7 @@ class App(ctk.CTk):
         self._redraw_rows()
 
     def _relayout_rows(self):
-        self._redraw_rows()
-
-    def _renumber_rows(self):
-        self._redraw_rows()
-
-    def _remove_row_widget(self, uid):
-        pass                     # 自绘没有独立控件需要销毁
+        self._redraw_rows()      # 发送失败置顶等顺序变化：整块重画
 
     def _display_order(self):
         """显示顺序：发送失败的置顶，其余保持处理顺序。"""
@@ -1394,10 +1407,17 @@ class App(ctk.CTk):
         return None
 
     def _refresh_uid(self, uid):
-        """刷新某一行（自绘模式下整块重画；行数不多时开销很小）。"""
-        if self._find_by_uid(uid) is None:
+        """刷新某一行：只改这一行的画布项属性（徽章/名字），O(1)，不重画。"""
+        found = self._find_by_uid(uid)
+        it = self._row_items.get(uid)
+        if found is None or it is None:
             return
-        self._redraw_rows()
+        p = found[1]
+        cv = self.rows_canvas
+        cv.itemconfig(it["badge_bg"], fill=BADGE_COLORS[p["status"]])
+        cv.itemconfig(it["badge_txt"], text=p["status"])
+        cv.itemconfig(it["name"],
+                      fill="#ef4444" if p["status"] == ST_FAILED else self._row_text_color())
 
     def _set_row_status(self, i):
         if not (0 <= i < len(self.queue)):
@@ -1687,7 +1707,11 @@ class App(ctk.CTk):
         self.leftover_bar.grid_remove()
 
     def op_del_row(self, uid):
-        """按稳定 uid 删除一行（连点删除时下标会变，所以不能用下标）。"""
+        """按稳定 uid 删除一行（连点删除时下标会变，所以不能用下标）。
+
+        画布上只销毁这一行的项、把下方行整体上移一格并刷新序号，
+        不整块重画，连点删除不闪也不卡。
+        """
         pos = next((j for j, p in enumerate(self.queue) if p["uid"] == uid), None)
         if pos is None:
             return
@@ -1697,12 +1721,31 @@ class App(ctk.CTk):
         if pos < self.idx:
             self.idx -= 1
         del self.queue[pos]
-        self._remove_row_widget(uid)
-        if not self.queue:
-            self._rebuild_rows()
+        it = self._row_items.pop(uid, None)
+        cv = self.rows_canvas
+        if it is None or not self.queue:
+            self._rebuild_rows()      # 没画过 / 删光了：整块重画出空状态
         else:
-            # 只销毁被删的那一行 + 刷新序号，不重排其它行，所以连点也不会闪
-            self._renumber_rows()
+            dy = self.ROW_H + self.ROW_GAP
+            del_y = it["y"]
+            cv.delete(f"row_{uid}")
+            cv.configure(cursor="")
+            for u, r in self._row_items.items():
+                if r["y"] > del_y:
+                    r["y"] -= dy
+                    cv.move(f"row_{u}", 0, -dy)
+            # 按新的纵向顺序刷新序号
+            for i2, (u, r) in enumerate(sorted(self._row_items.items(),
+                                               key=lambda kv: kv[1]["y"])):
+                cv.itemconfig(r["index"], text=str(i2 + 1))
+            # 收缩滚动范围，必要时收起滚动条
+            ch = cv.winfo_height() or 1
+            need = max((r["y"] for r in self._row_items.values()),
+                       default=0) + self.ROW_H + 6
+            cv.configure(scrollregion=(0, 0, cv.winfo_width() or 1, max(need, ch)))
+            self._sync_scrollbar(need > ch + 1)
+            if need <= ch + 1:
+                cv.yview_moveto(0)
         self._update_progress()
         self.run_log_msg(f"已删除：{name}")
 
