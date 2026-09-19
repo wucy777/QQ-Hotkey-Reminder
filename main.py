@@ -45,7 +45,7 @@ else:
 
 APP_NAME = "QQ Hotkey Reminder"
 APP_TITLE = "QQ 快捷提醒助手"
-__version__ = "1.1.1-beta"
+__version__ = "1.2.0"
 
 CONFIG_NAME = "config.json"
 LOG_NAME = "error.log"
@@ -58,12 +58,14 @@ ST_DONE = "已输入"
 ST_SKIPPED = "已跳过"
 ST_FAILED = "发送失败"
 
-BADGE_COLORS = {
-    ST_PENDING: "#5b6472",
-    ST_TYPING: "#f59e0b",
-    ST_DONE: "#16a34a",
-    ST_SKIPPED: "#6b7280",
-    ST_FAILED: "#dc2626",
+# 状态徽章：浅底深字的胶囊样式（深色：底/字，浅色：底/字）
+BADGE_STYLES = {
+    #              深色底      深色字      浅色底      浅色字
+    ST_PENDING:  ("#333a46", "#a8b0bd", "#e5e7eb", "#4b5563"),
+    ST_TYPING:   ("#3b2f14", "#fbbf24", "#fef3c7", "#92400e"),
+    ST_DONE:     ("#123528", "#4ade80", "#d6f5e5", "#0f766e"),
+    ST_SKIPPED:  ("#2b3038", "#8b93a1", "#e5e7eb", "#6b7280"),
+    ST_FAILED:   ("#3b1d1d", "#f87171", "#fee2e2", "#b91c1c"),
 }
 
 # ============ 默认配置（config.json 缺失或损坏时用它重新生成） ============
@@ -1211,7 +1213,23 @@ class App(ctk.CTk):
         return ("#9ca3af" if ctk.get_appearance_mode() == "Dark" else "#4b5563")
 
     def _row_card_hover_bg(self):
+        """整行悬停时的卡片底色（轻微提亮/压暗）。"""
+        return "#283040" if self._dark() else "#eef1f5"
+
+    def _del_hover_bg(self):
+        """✕ 悬停小方块的底色（比整行悬停更明显）。"""
         return "#313846" if self._dark() else "#dfe3e9"
+
+    def _index_chip_bg(self):
+        return "#2b3140" if self._dark() else "#e9ebef"
+
+    def _badge_colors(self, status):
+        """返回 (徽章底色, 徽章文字色)。队列画布是原生 tk.Canvas，
+        只认具体颜色字符串，所以这里按当前深浅色解析元组。"""
+        lbg, dbg, lfg, dfg = BADGE_STYLES[status]
+        if self._dark():
+            return dbg, dfg
+        return lbg, lfg
 
     def _dark(self):
         return ctk.get_appearance_mode() == "Dark"
@@ -1257,8 +1275,18 @@ class App(ctk.CTk):
         if it is None:
             return
         self.rows_canvas.itemconfig(it["hover"],
-                                    fill=self._row_card_hover_bg() if on else "")
+                                    fill=self._del_hover_bg() if on
+                                    else self._row_card_bg())
         self.rows_canvas.configure(cursor="hand2" if on else "")
+
+    def _row_hover(self, uid, on):
+        """整行悬停：卡片底色轻微提亮/压暗，只改一个画布项。"""
+        it = self._row_items.get(uid)
+        if it is None:
+            return
+        self.rows_canvas.itemconfig(it["card"],
+                                    fill=self._row_card_hover_bg() if on
+                                    else self._row_card_bg())
 
     def _redraw_rows(self):
         """整块重画：只在识别名单/重置/换深浅色/窗口尺寸变化时发生，
@@ -1270,7 +1298,16 @@ class App(ctk.CTk):
         self._row_items = {}
         order = self._display_order()
         if not order:
-            cv.create_text(cw // 2, 40, text="粘贴名单后点击「识别名单」，名单会显示在这里",
+            # 空状态：一个小气泡插图 + 引导文字
+            cx0 = cw // 2
+            bubble = "#2b3342" if self._dark() else "#dfe3ea"
+            dot = "#5b6472" if self._dark() else "#b6bcc6"
+            self._round_rect(cv, cx0 - 34, 30, cx0 + 34, 84, 14, bubble)
+            cv.create_polygon([(cx0 - 26, 80), (cx0 - 26, 102), (cx0 - 4, 80)],
+                              fill=bubble, smooth=True)
+            for dx in (-16, 0, 16):
+                cv.create_oval(cx0 + dx - 5, 51, cx0 + dx + 5, 61, fill=dot, outline="")
+            cv.create_text(cx0, 128, text="粘贴名单后点击「识别名单」，名单会显示在这里",
                            fill=self._row_sub_color(), font=self.font)
             cv.configure(scrollregion=(0, 0, cw, ch))     # 不留可滚动空隙
             self._sync_scrollbar(False)
@@ -1306,9 +1343,11 @@ class App(ctk.CTk):
         uid = p["uid"]
         tag = f"row_{uid}"
         dtag = f"del_{uid}"
-        bg = self._row_card_bg()
-        self._round_rect(cv, self.PAD_X, y, cw - self.PAD_X - 1, y + self.ROW_H, 9, bg,
-                         tags=(tag,))
+        card = self._round_rect(cv, self.PAD_X, y, cw - self.PAD_X - 1, y + self.ROW_H, 9,
+                                self._row_card_bg(), tags=(tag,))
+        # 整行悬停：鼠标进/出这一行时卡片轻微提亮/还原
+        cv.tag_bind(tag, "<Enter>", lambda e, u=uid: self._row_hover(u, True))
+        cv.tag_bind(tag, "<Leave>", lambda e, u=uid: self._row_hover(u, False))
         cy = y + self.ROW_H // 2
         # 固定右端：状态徽章 + 删除按钮
         del_x2 = cw - self.PAD_X - 12
@@ -1323,8 +1362,10 @@ class App(ctk.CTk):
         rest = max(60, avail - name_x)
         c_name = int(rest * w_name)
         c_qq = int(rest * w_qq)
-        # 序号
-        idx_id = cv.create_text(self.PAD_X + 20, cy, text=str(i + 1), anchor="w",
+        # 序号（小圆片弱化）
+        self._round_rect(cv, self.PAD_X + 8, cy - 11, self.PAD_X + 30, cy + 11, 8,
+                         self._index_chip_bg(), tags=(tag,))
+        idx_id = cv.create_text(self.PAD_X + 19, cy, text=str(i + 1),
                                 fill=self._row_sub_color(), font=self.font_badge,
                                 tags=(tag,))
         # 名字（发送失败标红）
@@ -1345,21 +1386,23 @@ class App(ctk.CTk):
                        text=self._ellipsis(meta, rest - c_name - c_qq, self.font_badge),
                        anchor="w", font=self.font_badge, tags=(tag,),
                        fill="#38bdf8" if p.get("extra") else self._row_sub_color())
-        # 状态徽章
+        # 状态徽章（浅底深字胶囊）
+        bg_c, fg_c = self._badge_colors(p["status"])
         badge_bg = self._round_rect(cv, badge_x1, y + 13, badge_x2, y + self.ROW_H - 13,
-                                    7, BADGE_COLORS[p["status"]], tags=(tag,))
+                                    12, bg_c, tags=(tag,))
         badge_tx = cv.create_text((badge_x1 + badge_x2) // 2, cy, text=p["status"],
-                                  fill="#ffffff", font=self.font_badge, tags=(tag,))
-        # 删除按钮：透明热区 + ✕。悬停时热区显示底色（见 _del_hover），
-        # 点击删除这一行；命中由 Canvas 按画布项处理，与滚动位置无关。
+                                  fill=fg_c, font=self.font_badge, tags=(tag,))
+        # 删除按钮：热区平时与卡片同色（隐形），悬停时显示底色（见 _del_hover）。
+        # 命中由 Canvas 按画布项处理，与滚动位置无关，不会再出现删错行。
         hover_id = cv.create_rectangle(del_x1 - 5, y + 7, del_x2 + 5, y + self.ROW_H - 7,
-                                       fill="", outline="", width=0, tags=(dtag, tag))
+                                       fill=self._row_card_bg(), outline="",
+                                       tags=(dtag, tag))
         cv.create_text((del_x1 + del_x2) // 2, cy, text="✕", font=self.font_row,
                        fill="#f87171" if self._dark() else "#dc2626", tags=(dtag, tag))
         cv.tag_bind(dtag, "<Enter>", lambda e, u=uid: self._del_hover(u, True))
         cv.tag_bind(dtag, "<Leave>", lambda e, u=uid: self._del_hover(u, False))
         cv.tag_bind(dtag, "<Button-1>", lambda e, u=uid: self.op_del_row(u))
-        self._row_items[uid] = {"index": idx_id, "name": name_id,
+        self._row_items[uid] = {"index": idx_id, "name": name_id, "card": card,
                                 "badge_bg": badge_bg, "badge_txt": badge_tx,
                                 "hover": hover_id, "y": y}
 
@@ -1414,8 +1457,9 @@ class App(ctk.CTk):
             return
         p = found[1]
         cv = self.rows_canvas
-        cv.itemconfig(it["badge_bg"], fill=BADGE_COLORS[p["status"]])
-        cv.itemconfig(it["badge_txt"], text=p["status"])
+        bg, fg = self._badge_colors(p["status"])
+        cv.itemconfig(it["badge_bg"], fill=bg)
+        cv.itemconfig(it["badge_txt"], text=p["status"], fill=fg)
         cv.itemconfig(it["name"],
                       fill="#ef4444" if p["status"] == ST_FAILED else self._row_text_color())
 
@@ -1499,6 +1543,9 @@ class App(ctk.CTk):
         n_failed = sum(1 for p in self.queue if p["status"] == ST_FAILED)
         self.count_lbl.configure(
             text=f"共 {n} 人" + (f"（{n_failed} 人发送失败）" if n_failed else ""))
+        # 全部处理完时进度条变绿，一眼看出这一轮结束了
+        done_all = n > 0 and self.idx >= n
+        self.progress.configure(progress_color="#22c55e" if done_all else "#3b82f6")
         self.progress.set((self.idx / n) if n else 0)
         if not n:
             self.progress_lbl.configure(text="尚未识别名单")
@@ -2160,7 +2207,7 @@ def run_selftest():
             lines.append("qq priority -> inline > map line > config")
 
             # 「发送失败」状态与置顶排序
-            ok &= (ST_FAILED in BADGE_COLORS)
+            ok &= (ST_FAILED in BADGE_STYLES)
             ok &= ("failed" in HOTKEY_KEYS and "failed" in DEFAULT_CONFIG["hotkeys"])
             ok &= ("failed" in HOTKEY_LABELS)
 

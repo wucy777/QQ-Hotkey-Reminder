@@ -7,3 +7,5 @@ config.json
 error.log
 selftest_result.txt
 *.bad.*
+_backup/
+_cache/
