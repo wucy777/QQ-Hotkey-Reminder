@@ -45,7 +45,7 @@ else:
 
 APP_NAME = "QQ Hotkey Reminder"
 APP_TITLE = "QQ 快捷提醒助手"
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 CONFIG_NAME = "config.json"
 LOG_NAME = "error.log"
@@ -991,8 +991,9 @@ class App(ctk.CTk):
         # 提醒页整体网格：
         #   row 0 = 标题行（表头直接放进左右两列，不再用跨列容器，保证和下面面板严格对齐）
         #   row 1 = 内容行
-        f.grid_columnconfigure(0, weight=1, minsize=340)   # 左列
-        f.grid_columnconfigure(1, weight=2, minsize=560)   # 右列
+        # uniform 让左右列严格 1:1 等分：内容变化不再相互挤占宽度
+        f.grid_columnconfigure(0, weight=1, minsize=400, uniform="cols")   # 左列
+        f.grid_columnconfigure(1, weight=1, minsize=400, uniform="cols")   # 右列
         f.grid_rowconfigure(1, weight=1)
 
         head_l = ctk.CTkFrame(f, fg_color="transparent")
@@ -1022,6 +1023,8 @@ class App(ctk.CTk):
         left.grid(row=1, column=0, sticky="nsew", padx=(4, 12))
         left.grid_columnconfigure(0, weight=1)
         left.grid_rowconfigure(1, weight=1)
+        # 内容不再反向撑大列宽：uniform 的 1:2 分宽才能真正锁死，不相互挤占
+        left.grid_propagate(False)
         # 固定提示文本：不可编辑。wraplength 随容器宽度自适应，
         # 否则字号或窗口一变就会换行错乱（出现单字孤行）
         hint = ctk.CTkLabel(
@@ -1033,11 +1036,16 @@ class App(ctk.CTk):
 
         def _fit_hint(e=None):
             try:
-                w = left.winfo_width() - 24        # 减去 ipadx(10*2) 与余量
-                if w > 120 and abs(hint.cget("wraplength") - w) > 8:
+                # e.width 是物理像素；wraplength 是逻辑像素（CTk 内部会乘 DPI
+                # 缩放）。先除回缩放系数换算成逻辑值，再减 ipadx(10×2) 与余量，
+                # 否则高 DPI 下 wraplength 会比标签实际宽度大，文字被裁切。
+                px = (e.width if e is not None else hint.winfo_width()) - 20
+                w = int(px / self._widget_scale() - 6)
+                if w > 120 and abs(hint.cget("wraplength") - w) > 4:
                     hint.configure(wraplength=w)
             except Exception:
                 pass
+        hint.bind("<Configure>", _fit_hint)
         left.bind("<Configure>", _fit_hint)
         self.list_text = ctk.CTkTextbox(left, font=self.font, wrap="word",
                                         width=280, fg_color=("gray94", "#161920"))
@@ -1057,6 +1065,7 @@ class App(ctk.CTk):
         right.grid_columnconfigure(0, weight=1)
         # 队列区（row 0）吸收多余空间；其余行按内容高度
         right.grid_rowconfigure(0, weight=1)
+        right.grid_propagate(False)
 
         self.rows_frame = self._build_rows_area(right)
         self.rows_frame.grid(row=0, column=0, sticky="nsew")
@@ -1089,11 +1098,13 @@ class App(ctk.CTk):
 
         def _fit_hk_hint(e=None):
             try:
-                w = right.winfo_width() - 16
-                if w > 120 and abs(self.hk_hint_lbl.cget("wraplength") - w) > 12:
+                px = (e.width if e is not None else self.hk_hint_lbl.winfo_width()) - 4
+                w = int(px / self._widget_scale())
+                if w > 120 and abs(self.hk_hint_lbl.cget("wraplength") - w) > 4:
                     self.hk_hint_lbl.configure(wraplength=w)
             except Exception:
                 pass
+        self.hk_hint_lbl.bind("<Configure>", _fit_hk_hint)
         right.bind("<Configure>", _fit_hk_hint)
 
         self.run_log = self._logbox(right, height=88)
@@ -1234,6 +1245,24 @@ class App(ctk.CTk):
     def _dark(self):
         return ctk.get_appearance_mode() == "Dark"
 
+    def _widget_scale(self):
+        """CTk 的字体/wraplength 是「逻辑像素」，会乘这个 DPI 缩放系数；
+        而 tk 事件的 e.width/e.height 是「物理像素」。两者换算全靠它。"""
+        try:
+            s = self._get_widget_scaling()
+            if s and s > 0:
+                return float(s)
+        except Exception:
+            pass
+        try:
+            st = getattr(ctk, "ScalingTracker", None)
+            s = st.get_widget_scaling(self)
+            if s and s > 0:
+                return float(s)
+        except Exception:
+            pass
+        return 1.0
+
     def _rows_wheel(self, event):
         # 内容放得下时不响应滚轮，避免把名单滚出可视区留下一片空白
         if not self._rows_need_scroll():
@@ -1326,15 +1355,14 @@ class App(ctk.CTk):
             cv.yview_moveto(0)
 
     def _sync_scrollbar(self, need_scroll):
-        """内容放得下就隐藏滚动条（占位效果用 padx 不变，避免右侧跳动）。"""
+        """内容放得下就收起滚动条。不做 winfo_ismapped 判断——启动时窗口
+        还没映射，ismapped 恒为 False 会跳过隐藏，滚动条就一直挂在空状态上。"""
         if not hasattr(self, "rows_sb"):
             return
         if need_scroll:
-            if not self.rows_sb.winfo_ismapped():
-                self.rows_sb.pack(side="right", fill="y", padx=(0, 4), pady=4)
+            self.rows_sb.pack(side="right", fill="y", padx=(0, 4), pady=4)
         else:
-            if self.rows_sb.winfo_ismapped():
-                self.rows_sb.pack_forget()
+            self.rows_sb.pack_forget()
 
     def _draw_row(self, cv, i, p, y, cw):
         """画一行。画布项常驻并按 uid 打 tag，之后悬停/改状态/删除
@@ -2014,6 +2042,7 @@ class App(ctk.CTk):
                 raise RuntimeError("校验失败：编辑框内容与配置文件不一致")
             self.cfg = merged_config(data)
             self.current_config_path = target
+            self.cfg_log_msg(f"已重新读取：{target}")
             # 配置里的 line_mode 可能被改过，同步到勾选框（不触发写盘）
             try:
                 self.line_mode_var.set(bool(self.cfg.get("line_mode", False)))
